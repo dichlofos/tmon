@@ -560,18 +560,24 @@ def add_tmon_benchmark(result: dict, operations: list[dict], date_till: str, pro
 
 
 def sort_by_pnl(result: dict) -> None:
+    turnover_totals = defaultdict(Decimal)
     pnl_totals = defaultdict(lambda: {"pnl": Decimal(0), "missing": 0, "count": 0})
     for group, field in (("open_instruments", "hypothetical_pnl"), ("closed_instruments", "pnl")):
         for row in result[group]:
+            row["turnover"] = row.get("buy_cost", Decimal(0)) + row.get("sell_cost", Decimal(0))
+            turnover_totals[row["currency"]] += row["turnover"]
             total = pnl_totals[row["currency"]]
             value = row.get(field)
             invested = row.get("buy_cost", Decimal(0)) + (row.get("opening_value") or Decimal(0))
             row["pnl_return_percent"] = value / invested * 100 if value is not None and invested > 0 else None
+            commission = row.get("commission", Decimal(0))
+            row["efficiency"] = value / commission if value is not None and commission > 0 else None
             if value is None:
                 total["missing"] += 1
             else:
                 total["pnl"] += value
                 total["count"] += 1
+    result["turnover_totals"] = [{"currency": currency, "turnover": amount} for currency, amount in sorted(turnover_totals.items())]
     result["pnl_totals"] = [{"currency": currency, **values} for currency, values in sorted(pnl_totals.items())]
     for group, field in (("open_instruments", "hypothetical_pnl"), ("closed_instruments", "pnl")):
         result[group].sort(

@@ -326,3 +326,29 @@ class NearZeroBenchmarkTest(unittest.TestCase):
         from app import format_rubles
         self.assertTrue(format_number(Decimal('1E+30')).endswith(',00'))
         self.assertTrue(format_rubles(Decimal('1E+30')).startswith('1 '))
+
+
+class EfficiencyTest(unittest.TestCase):
+    def test_efficiency_with_profit_loss_zero_fee_and_missing_pnl(self):
+        from app import sort_by_pnl
+        rows = [{"currency": "RUB", "pnl": pnl, "commission": fee} for pnl, fee in [
+            (Decimal(100), Decimal(5)), (Decimal(-10), Decimal(2)),
+            (Decimal(0), Decimal(2)), (Decimal(100), Decimal(0)), (None, Decimal(2)),
+        ]]
+        result = {"closed_instruments": list(rows), "open_instruments": []}
+        sort_by_pnl(result)
+        self.assertEqual([row["efficiency"] for row in rows], [Decimal(20), Decimal(-5), Decimal(0), None, None])
+
+
+class TurnoverTest(unittest.TestCase):
+    def test_turnover_counts_trades_even_without_pnl_and_separates_currencies(self):
+        from app import sort_by_pnl
+        rows = [
+            {"currency": "RUB", "buy_cost": Decimal(100), "sell_cost": Decimal(200), "hypothetical_pnl": None, "cash_adjustment": Decimal(50)},
+            {"currency": "USD", "buy_cost": Decimal(10), "sell_cost": Decimal(20), "hypothetical_pnl": Decimal(1)},
+        ]
+        closed = {"currency": "RUB", "buy_cost": Decimal(20), "sell_cost": Decimal(30), "pnl": Decimal(10)}
+        result = {"open_instruments": rows, "closed_instruments": [closed]}
+        sort_by_pnl(result)
+        self.assertEqual(result["turnover_totals"], [{"currency": "RUB", "turnover": Decimal(350)}, {"currency": "USD", "turnover": Decimal(30)}])
+        self.assertEqual(closed["turnover"], Decimal(50))
