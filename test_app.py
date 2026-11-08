@@ -140,7 +140,7 @@ class BondBenchmarkTest(unittest.TestCase):
         self.assertIsNone(row["tmon_pnl"])
         with app.app_context():
             html = app.jinja_env.get_template("index.html").render(accounts=[], form={}, result=result, error=None)
-        self.assertNotIn("BOND", html.split("Сравнение с TMON")[1])
+        self.assertNotIn('<h2 class="h5">Сравнение с TMON</h2>', html)
 
 
 class IncomeTest(unittest.TestCase):
@@ -183,3 +183,146 @@ class IncomeTest(unittest.TestCase):
         with patch("app.get_closing_price", return_value=(Decimal(110), "2026-01-01")):
             add_hypothetical_pnl(result, "01.01.2026")
         self.assertEqual(result["open_instruments"][0]["hypothetical_pnl"], Decimal(27))
+
+
+class PayoutGroupingTest(unittest.TestCase):
+    def test_payout_without_ticker_is_added_to_instrument_row(self):
+        result = summarize([
+            {"ticker": "TEST", "instrumentUid": "uid", "name": "Instrument", "type": "OPERATION_TYPE_BUY", "quantity": "1", "price": money(100)},
+            {"instrumentUid": "uid", "name": "Dividend payment", "type": "OPERATION_TYPE_DIVIDEND", "payment": money(20)},
+            {"instrumentUid": "uid", "type": "OPERATION_TYPE_DIVIDEND_TAX", "payment": money(-3)},
+        ])
+        self.assertEqual(len(result["open_instruments"]), 1)
+        row = result["open_instruments"][0]
+        self.assertEqual(row["ticker"], "TEST")
+        self.assertEqual(row["name"], "Instrument")
+        self.assertEqual(row["cash_adjustment"], Decimal(17))
+
+
+class PnlSortTest(unittest.TestCase):
+    def test_profit_descending_with_missing_values_last(self):
+        from app import sort_by_pnl
+        result = {"open_instruments": [
+            {"hypothetical_pnl": None}, {"hypothetical_pnl": Decimal(-10)},
+            {"hypothetical_pnl": Decimal(0)}, {"hypothetical_pnl": Decimal(20)},
+        ], "closed_instruments": [{"pnl": Decimal(-1)}, {"pnl": Decimal(3)}]}
+        for row in result["open_instruments"] + result["closed_instruments"]:
+            row["currency"] = "RUB"
+        sort_by_pnl(result)
+        self.assertEqual(result["pnl_totals"], [{"currency": "RUB", "pnl": Decimal(12), "missing": 1, "count": 5}])
+        self.assertEqual([r["hypothetical_pnl"] for r in result["open_instruments"]], [Decimal(20), Decimal(0), Decimal(-10), None])
+        self.assertEqual([r["pnl"] for r in result["closed_instruments"]], [Decimal(3), Decimal(-1)])
+
+
+class InitialPositionTest(unittest.TestCase):
+    def test_excess_sales_are_not_valued_as_a_short(self):
+        from unittest.mock import patch
+        result = summarize([
+            {"ticker": "LQDT", "instrumentUid": "uid", "type": "OPERATION_TYPE_BUY", "quantity": "1", "price": money(2)},
+            {"ticker": "LQDT", "instrumentUid": "uid", "type": "OPERATION_TYPE_SELL", "quantity": "10", "price": money(2)},
+        ])
+        with patch("app.get_closing_price") as quote:
+            add_hypothetical_pnl(result, "08.11.2026")
+            quote.assert_not_called()
+        self.assertIsNone(result["open_instruments"][0]["hypothetical_pnl"])
+        self.assertIn("начальной позиции", result["open_instruments"][0]["valuation_note"])
+
+
+class PeriodReportTest(unittest.TestCase):
+    def report(self, positions, operations, prices, ticker="TEST", accrued=None):
+        from unittest.mock import patch
+        from app import build_period_report
+        def api(service, method, payload):
+            if method == "GetPortfolio":
+                return {"positions": positions}
+            if method == "GetAccruedInterests":
+                day = payload["from"][:10]
+                return {"accruedInterests": [{"date": day + "T00:00:00Z", "nominal": money(800), "value": money(10)}]}
+            raise AssertionError(method)
+        with patch("app.api_call", side_effect=api), patch("app.get_operations", return_value=operations), patch("app.get_closing_price", side_effect=lambda instrument, day: (Decimal(prices[day]), "2025-12-31")), patch("app.add_tmon_benchmark"):
+            return build_period_report("test", "01.01.2026", "31.01.2026", ticker)
+
+    def test_opening_position_sale_does_not_become_short(self):
+        ops = [{"ticker": "TEST", "instrumentUid": "uid", "type": "OPERATION_TYPE_SELL", "date": "2026-01-10T10:00:00Z", "quantity": "10", "price": money(110)}]
+        result = self.report([], ops, {"31.12.2025": "100"})
+        row = result["closed_instruments"][0]
+        self.assertEqual(row["opening_quantity"], Decimal(10))
+        self.assertEqual(row["closing_quantity"], Decimal(0))
+        self.assertEqual(row["pnl"], Decimal(100))
+
+    def test_position_without_trades_includes_dividends_and_tax(self):
+        position = {"ticker": "TEST", "instrumentUid": "uid", "instrumentType": "share", "quantity": money(10)}
+        ops = [
+            {"ticker": "TEST", "type": "OPERATION_TYPE_DIVIDEND", "date": "2026-01-10T10:00:00Z", "payment": money(20)},
+            {"ticker": "TEST", "type": "OPERATION_TYPE_DIVIDEND_TAX", "date": "2026-01-10T10:00:00Z", "payment": money(-3)},
+        ]
+        row = self.report([position], ops, {"31.12.2025": "100", "31.01.2026": "110"})["open_instruments"][0]
+        self.assertEqual(row["opening_quantity"], Decimal(10))
+        self.assertEqual(row["hypothetical_pnl"], Decimal(117))
+
+    def test_trades_after_period_are_reversed(self):
+        position = {"ticker": "TEST", "instrumentUid": "uid", "quantity": money(15)}
+        ops = [{"ticker": "TEST", "type": "OPERATION_TYPE_BUY", "date": "2026-02-10T10:00:00Z", "quantity": "5", "price": money(120)}]
+        row = self.report([position], ops, {"31.12.2025": "100", "31.01.2026": "110"})["open_instruments"][0]
+        self.assertEqual(row["closing_quantity"], Decimal(10))
+        self.assertEqual(row["hypothetical_pnl"], Decimal(100))
+
+    def test_bond_amortization_uses_historical_nominal_and_nkd(self):
+        position = {"ticker": "TEST", "instrumentUid": "uid", "instrumentType": "bond", "quantity": money(2)}
+        ops = [{"ticker": "TEST", "type": "OPERATION_TYPE_COUPON", "date": "2026-01-10T10:00:00Z", "payment": money(50)}]
+        row = self.report([position], ops, {"31.12.2025": "100", "31.01.2026": "101"})["open_instruments"][0]
+        self.assertEqual(row["opening_value"], Decimal(1620))
+        self.assertEqual(row["closing_value"], Decimal(1636))
+        self.assertEqual(row["hypothetical_pnl"], Decimal(66))
+
+
+class OpeningBenchmarkTest(unittest.TestCase):
+    def test_opening_capital_is_invested_in_tmon(self):
+        from unittest.mock import patch
+        from app import add_tmon_benchmark
+        row = {"ticker": "TEST", "currency": "RUB", "buy_cost": Decimal(0), "opening_value": Decimal(1000), "pnl": Decimal(150)}
+        result = {"open_instruments": [], "closed_instruments": [row]}
+        operations = [
+            {"ticker": "TEST", "type": "OPERATION_TYPE_BUY", "date": "2026-01-01T00:00:00Z", "quantity": "10", "benchmark_capital": Decimal(1000), "benchmark_day": "31.12.2025", "benchmark_normalized": True},
+            {"ticker": "TEST", "type": "OPERATION_TYPE_SELL", "date": "2026-01-10T10:00:00Z", "quantity": "10"},
+        ]
+        prices = {"31.12.2025": Decimal(100), "10.01.2026": Decimal(110)}
+        with patch("app.get_closing_price", side_effect=lambda instrument, day: (prices[day], "2026-01-01")):
+            add_tmon_benchmark(result, operations, "31.01.2026")
+        self.assertEqual(row["tmon_pnl"], Decimal(100))
+        self.assertEqual(row["tmon_difference"], Decimal(50))
+        self.assertEqual(row["tmon_difference_pp"], Decimal(5))
+        self.assertEqual(row["tmon_relative_percent"], Decimal(50))
+
+
+class ReturnPercentTest(unittest.TestCase):
+    def test_return_uses_opening_capital_and_purchases(self):
+        from app import sort_by_pnl
+        row = {"currency": "RUB", "pnl": Decimal(43901), "buy_cost": Decimal(86448), "opening_value": Decimal(100000)}
+        result = {"open_instruments": [], "closed_instruments": [row]}
+        sort_by_pnl(result)
+        self.assertEqual(row["pnl_return_percent"], Decimal(43901) / Decimal(186448) * 100)
+
+
+class NearZeroBenchmarkTest(unittest.TestCase):
+    def test_negligible_tmon_profit_has_no_relative_percent(self):
+        from unittest.mock import patch
+        from app import add_tmon_benchmark, app
+        row = {"ticker": "TEST", "currency": "RUB", "buy_cost": Decimal(100), "pnl": Decimal(20)}
+        result = {"open_instruments": [], "closed_instruments": [row]}
+        operations = [
+            {"ticker": "TEST", "type": "OPERATION_TYPE_BUY", "date": "2026-01-01T10:00:00Z", "quantity": "1", "price": money(100)},
+            {"ticker": "TEST", "type": "OPERATION_TYPE_SELL", "date": "2026-01-02T10:00:00Z", "quantity": "1"},
+        ]
+        prices = [Decimal(3), Decimal('3.000000000000000000000000001')]
+        with patch('app.get_closing_price', side_effect=lambda *args: (prices.pop(0), '2026-01-01')):
+            add_tmon_benchmark(result, operations, '02.01.2026')
+        self.assertIsNone(row['tmon_relative_percent'])
+        with app.app_context():
+            module = app.jinja_env.get_template("index.html").make_module({"form": {}, "accounts": [], "result": None})
+            self.assertNotIn("%", str(module.tmon_cells(row)))
+
+    def test_large_decimal_formats_without_crashing(self):
+        from app import format_rubles
+        self.assertTrue(format_number(Decimal('1E+30')).endswith(',00'))
+        self.assertTrue(format_rubles(Decimal('1E+30')).startswith('1 '))

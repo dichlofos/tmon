@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import os
 import secrets
+import hashlib
+from contextvars import ContextVar
+import sqlite3
 import threading
 import time as clock
 import urllib.error
@@ -9,11 +12,13 @@ import urllib.request
 import json
 from collections import defaultdict
 from datetime import datetime, time, timedelta, timezone
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, localcontext
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from flask import Flask, jsonify, render_template, request
+
+from api_cache import ApiCache
 
 
 API_ROOT = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1"
@@ -32,7 +37,7 @@ SELL_TYPES = {
     "OPERATION_TYPE_DELIVERY_SELL",
 }
 COUPON_TYPES = {"OPERATION_TYPE_COUPON"}
-DIVIDEND_TYPES = {"OPERATION_TYPE_DIVIDEND", "OPERATION_TYPE_DIVIDEND_TRANSFER"}
+DIVIDEND_TYPES = {"OPERATION_TYPE_DIVIDEND", "OPERATION_TYPE_DIVIDEND_TRANSFER", "OPERATION_TYPE_DIV_EXT"}
 INCOME_TAX_TYPES = {
     "OPERATION_TYPE_DIVIDEND_TAX", "OPERATION_TYPE_DIVIDEND_TAX_PROGRESSIVE",
     "OPERATION_TYPE_BOND_TAX", "OPERATION_TYPE_BOND_TAX_PROGRESSIVE",
@@ -47,6 +52,7 @@ CORPORATE_ACTIONS = {
 }
 
 app = Flask(__name__)
+REPORT_CACHE = ContextVar("report_cache", default=None)
 JOBS = {}
 JOBS_LOCK = threading.Lock()
 
@@ -66,7 +72,63 @@ def read_token() -> str:
     return token.removeprefix("Bearer ").strip()
 
 
+def form_settings(value=None):
+    try:
+        cache = ApiCache(os.getenv("TMON_CACHE_FILE", str(Path(__file__).parent / ".cache" / "api.sqlite3")))
+        key = cache.key(hashlib.sha256(read_token().encode()).hexdigest(), "ui", "last_form", {})
+        if value is not None:
+            cache.set_setting(key, {field: value.get(field, "") for field in ("account_id", "date_from", "date_till", "ticker")})
+            return value
+        saved = cache.get_setting(key)
+        return saved if isinstance(saved, dict) else {}
+    except (TBankError, OSError, sqlite3.Error, ValueError):
+        app.logger.warning("Could not persist or restore last report form")
+        return {}
+
+
+def cache_ttl(service: str, method: str, payload: dict) -> int:
+    if method in {"GetPortfolio", "GetPositions"}:
+        return 0
+    if method in {"GetOperationsByCursor", "GetCandles", "GetAccruedInterests"}:
+        try:
+            end = datetime.fromisoformat(payload["to"].replace("Z", "+00:00"))
+            if end > datetime.now(timezone.utc) - timedelta(days=2):
+                return 0 if method == "GetOperationsByCursor" else 60
+        except (KeyError, ValueError):
+            return 0
+        return 3600 if method == "GetOperationsByCursor" else 86400
+    return 60 if method == "GetAccounts" else 86400
+
+
 def api_call(service: str, method: str, payload: dict) -> dict:
+    ttl = cache_ttl(service, method, payload)
+    token = read_token()
+    cache = ApiCache(os.getenv("TMON_CACHE_FILE", str(Path(__file__).parent / ".cache" / "api.sqlite3")))
+    key = cache.key(hashlib.sha256(token.encode()).hexdigest(), service, method, payload)
+    memo = REPORT_CACHE.get()
+    if memo is not None and key in memo:
+        return memo[key]
+    if ttl:
+        try:
+            cached = cache.get(key)
+            if cached is not None:
+                if memo is not None:
+                    memo[key] = cached
+                return cached
+        except (OSError, sqlite3.Error, ValueError):
+            app.logger.warning("API cache read failed; requesting fresh data")
+    response = uncached_api_call(service, method, payload, token)
+    if ttl:
+        try:
+            cache.put(key, response, ttl)
+        except (OSError, sqlite3.Error, ValueError):
+            app.logger.warning("API cache write failed")
+    if memo is not None:
+        memo[key] = response
+    return response
+
+
+def uncached_api_call(service: str, method: str, payload: dict, token: str) -> dict:
     url = f"{API_ROOT}.{service}/{method}"
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
@@ -74,7 +136,7 @@ def api_call(service: str, method: str, payload: dict) -> dict:
         data=body,
         method="POST",
         headers={
-            "Authorization": f"Bearer {read_token()}",
+            "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "Accept": "application/json",
         },
@@ -111,7 +173,42 @@ def parse_period(date_from: str, date_till: str) -> tuple[str, str]:
     return start.isoformat().replace("+00:00", "Z"), end.isoformat().replace("+00:00", "Z")
 
 
-def get_operations(account_id: str, date_from: str, date_till: str, progress=None) -> list[dict]:
+def link_operation_metadata(operations: list[dict]) -> None:
+    """Attach payouts to the same instrument as trades using explicit IDs."""
+    metadata = {}
+    for operation in operations:
+        if operation.get("ticker"):
+            for field in ("instrumentUid", "figi", "positionUid"):
+                if operation.get(field):
+                    metadata[operation[field]] = operation
+    for operation in operations:
+        for field in ("instrumentUid", "figi", "positionUid"):
+            source = metadata.get(operation.get(field))
+            if source:
+                for key in ("ticker", "instrumentType", "classCode"):
+                    if not operation.get(key) and source.get(key):
+                        operation[key] = source[key]
+                break
+
+
+def get_operations(account_id: str, date_from: str, date_till: str, progress=None, all_types=False) -> list[dict]:
+    parse_period(date_from, date_till)
+    first = datetime.strptime(date_from, "%d.%m.%Y").date()
+    last = datetime.strptime(date_till, "%d.%m.%Y").date()
+    operations = []
+    while first <= last:
+        next_month = (first.replace(day=28) + timedelta(days=4)).replace(day=1)
+        chunk_last = min(last, next_month - timedelta(days=1))
+        def chunk_progress(stage, completed, total):
+            if progress:
+                progress(stage, len(operations) + completed, total)
+        operations.extend(get_operations_chunk(account_id, first.strftime("%d.%m.%Y"), chunk_last.strftime("%d.%m.%Y"), chunk_progress, all_types))
+        first = next_month
+    link_operation_metadata(operations)
+    return operations
+
+
+def get_operations_chunk(account_id: str, date_from: str, date_till: str, progress=None, all_types=False) -> list[dict]:
     start, end = parse_period(date_from, date_till)
     cursor = ""
     operations: list[dict] = []
@@ -127,6 +224,8 @@ def get_operations(account_id: str, date_from: str, date_till: str, progress=Non
             "withoutTrades": True,
             "withoutOvernights": True,
         }
+        if all_types:
+            payload.pop("operationTypes")
         if cursor:
             payload["cursor"] = cursor
         page = api_call("OperationsService", "GetOperationsByCursor", payload)
@@ -134,21 +233,8 @@ def get_operations(account_id: str, date_from: str, date_till: str, progress=Non
         if progress:
             progress("Загрузка операций", len(operations), None)
         if not page.get("hasNext"):
-            # Payout records can omit ticker; join only using explicit instrument IDs.
-            metadata = {}
-            for operation in operations:
-                if operation.get("ticker"):
-                    for field in ("instrumentUid", "figi", "positionUid"):
-                        if operation.get(field):
-                            metadata[operation[field]] = operation
-            for operation in operations:
-                for field in ("instrumentUid", "figi", "positionUid"):
-                    source = metadata.get(operation.get(field))
-                    if source:
-                        for key in ("ticker", "instrumentType", "classCode"):
-                            if not operation.get(key) and source.get(key):
-                                operation[key] = source[key]
-                        break
+            operations = [op for op in operations if start <= op.get("date", "") < end]
+            link_operation_metadata(operations)
             return operations
         next_cursor = page.get("nextCursor")
         if not next_cursor or next_cursor == cursor:
@@ -158,23 +244,31 @@ def get_operations(account_id: str, date_from: str, date_till: str, progress=Non
 
 def get_closing_price(instrument_id: str, date_till: str) -> tuple[Decimal, str] | None:
     target = datetime.strptime(date_till.strip(), "%d.%m.%Y").date()
-    start = datetime.combine(target - timedelta(days=14), time.min, timezone.utc)
-    end = datetime.combine(target + timedelta(days=1), time.min, timezone.utc)
-    data = api_call("MarketDataService", "GetCandles", {
-        "instrumentId": instrument_id,
-        "from": start.isoformat().replace("+00:00", "Z"),
-        "to": end.isoformat().replace("+00:00", "Z"),
-        "interval": "CANDLE_INTERVAL_DAY",
-        "candleSourceType": "CANDLE_SOURCE_EXCHANGE",
-    })
+    earliest = target - timedelta(days=14)
+    month = earliest.replace(day=1)
+    candles = []
+    while month <= target:
+        next_month = (month.replace(day=28) + timedelta(days=4)).replace(day=1)
+        end_day = min(next_month, datetime.now(timezone.utc).date() + timedelta(days=1))
+        if end_day <= month:
+            break
+        data = api_call("MarketDataService", "GetCandles", {
+            "instrumentId": instrument_id,
+            "from": datetime.combine(month, time.min, timezone.utc).isoformat().replace("+00:00", "Z"),
+            "to": datetime.combine(end_day, time.min, timezone.utc).isoformat().replace("+00:00", "Z"),
+            "interval": "CANDLE_INTERVAL_DAY",
+            "candleSourceType": "CANDLE_SOURCE_EXCHANGE",
+        })
+        candles.extend(data.get("candles", []))
+        month = next_month
     candidates = []
-    for candle in data.get("candles", []):
+    for candle in candles:
         candle_time = candle.get("time", "")
         try:
             candle_date = datetime.fromisoformat(candle_time.replace("Z", "+00:00")).astimezone(MOSCOW).date()
         except ValueError:
             continue
-        if candle_date <= target:
+        if earliest <= candle_date <= target:
             candidates.append((candle_time, candle))
     if not candidates:
         return None
@@ -218,6 +312,7 @@ def is_bond(operation: dict) -> bool:
 
 
 def summarize(operations: list[dict], as_of_date: str | None = None) -> dict:
+    link_operation_metadata(operations)
     totals = {
         "buy_quantity": 0,
         "sell_quantity": 0,
@@ -265,7 +360,8 @@ def summarize(operations: list[dict], as_of_date: str | None = None) -> dict:
         instrument = instruments[instrument_key]
         instrument["is_bond"] = instrument["is_bond"] or is_bond(operation)
         instrument["ticker"] = operation.get("ticker") or operation.get("figi") or "—"
-        instrument["name"] = operation.get("name") or operation.get("description") or ""
+        if not instrument["name"] or operation_type in BUY_TYPES | SELL_TYPES:
+            instrument["name"] = operation.get("name") or operation.get("description") or ""
         instrument["currency"] = price_currency
         market_id = (
             f"{operation.get('ticker')}_{operation.get('classCode')}"
@@ -345,6 +441,9 @@ def add_hypothetical_pnl(result: dict, date_till: str, progress=None) -> None:
         row["close_price"] = None
         row["close_date"] = None
         row["hypothetical_pnl"] = None
+        if row["quantity_delta"] < 0:
+            row["valuation_note"] = "Продано больше, чем куплено за период: неизвестна себестоимость начальной позиции или шорта"
+            continue
         if row.get("is_bond"):
             row["valuation_note"] = "Оценка остатка требует исторического номинала и НКД; выплаты учтены отдельно"
             continue
@@ -376,7 +475,7 @@ def add_tmon_benchmark(result: dict, operations: list[dict], date_till: str, pro
         if operation.get("type") in CASH_TYPES or is_bond(operation) or (operation.get("price") or {}).get("currency", "").upper() != "RUB":
             continue
         try:
-            dates.add(datetime.fromisoformat(operation.get("date", "").replace("Z", "+00:00")).astimezone(MOSCOW).strftime("%d.%m.%Y"))
+            dates.add(operation.get("benchmark_day") or datetime.fromisoformat(operation.get("date", "").replace("Z", "+00:00")).astimezone(MOSCOW).strftime("%d.%m.%Y"))
         except ValueError:
             pass
     if dates:
@@ -404,8 +503,11 @@ def add_tmon_benchmark(result: dict, operations: list[dict], date_till: str, pro
         key = operation.get("ticker") or operation.get("figi") or operation.get("instrumentUid") or "—"
         grouped[key].append(operation)
     for row in result["open_instruments"] + result["closed_instruments"]:
-        row.update(tmon_pnl=None, tmon_difference=None, tmon_difference_pp=None, tmon_error=None)
+        row.update(tmon_pnl=None, tmon_difference=None, tmon_difference_pp=None, tmon_relative_percent=None, tmon_error=None)
         if row.get("is_bond"):
+            continue
+        if row.get("benchmark_blocked"):
+            row["tmon_error"] = row["benchmark_blocked"]
             continue
         if row["currency"] != "RUB":
             row["tmon_error"] = "Только рублёвые инструменты"
@@ -417,13 +519,15 @@ def add_tmon_benchmark(result: dict, operations: list[dict], date_till: str, pro
                 timestamp = datetime.fromisoformat(op.get("date", "").replace("Z", "+00:00"))
                 if timestamp.tzinfo is None:
                     raise ValueError("Дата операции без часового пояса")
-                day = timestamp.astimezone(MOSCOW).strftime("%d.%m.%Y")
-                quantity = Decimal(int(op.get("quantityDone") or op.get("quantity") or 0))
-                quantity *= split_factor(row["ticker"], op.get("date", ""), date_till)
+                day = op.get("benchmark_day") or timestamp.astimezone(MOSCOW).strftime("%d.%m.%Y")
+                quantity = Decimal(str(op.get("quantityDone") or op.get("quantity") or 0))
+                if not op.get("benchmark_normalized"):
+                    quantity *= split_factor(row["ticker"], op.get("date", ""), date_till)
                 if quantity <= 0:
                     continue
                 if op.get("type") in BUY_TYPES:
                     capital = decimal_value(op.get("price")) * quantity / split_factor(row["ticker"], op.get("date", ""), date_till)
+                    capital = op.get("benchmark_capital", capital)
                     lots.append([quantity, capital, capital / price_on(day)])
                 elif op.get("type") in SELL_TYPES:
                     close = price_on(day)
@@ -443,20 +547,47 @@ def add_tmon_benchmark(result: dict, operations: list[dict], date_till: str, pro
                 close = price_on(date_till)
                 profit += sum((units * close - capital for _, capital, units in lots), Decimal(0))
             row["tmon_pnl"] = profit
-            actual = row.get("pnl", row.get("hypothetical_pnl"))
+            actual = row.get("pnl") if row.get("pnl") is not None else row.get("hypothetical_pnl")
             if actual is not None:
                 row["tmon_difference"] = actual - profit
-                if row["buy_cost"] > 0:
-                    row["tmon_difference_pp"] = (actual - profit) / row["buy_cost"] * 100
+                if profit.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) > 0:
+                    row["tmon_relative_percent"] = (actual - profit) / profit * 100
+                invested = row["buy_cost"] + (row.get("opening_value") or Decimal(0))
+                if invested > 0:
+                    row["tmon_difference_pp"] = (actual - profit) / invested * 100
         except (TBankError, ValueError) as exc:
             row["tmon_error"] = str(exc)
+
+
+def sort_by_pnl(result: dict) -> None:
+    pnl_totals = defaultdict(lambda: {"pnl": Decimal(0), "missing": 0, "count": 0})
+    for group, field in (("open_instruments", "hypothetical_pnl"), ("closed_instruments", "pnl")):
+        for row in result[group]:
+            total = pnl_totals[row["currency"]]
+            value = row.get(field)
+            invested = row.get("buy_cost", Decimal(0)) + (row.get("opening_value") or Decimal(0))
+            row["pnl_return_percent"] = value / invested * 100 if value is not None and invested > 0 else None
+            if value is None:
+                total["missing"] += 1
+            else:
+                total["pnl"] += value
+                total["count"] += 1
+    result["pnl_totals"] = [{"currency": currency, **values} for currency, values in sorted(pnl_totals.items())]
+    for group, field in (("open_instruments", "hypothetical_pnl"), ("closed_instruments", "pnl")):
+        result[group].sort(
+            key=lambda row: (row.get(field) is not None, row.get(field) or Decimal(0)),
+            reverse=True,
+        )
 
 
 @app.template_filter("rubles")
 def format_rubles(value: Decimal | int | None) -> str:
     if value is None:
         return "—"
-    rounded = Decimal(value).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    value = Decimal(value)
+    with localcontext() as context:
+        context.prec = max(28, len(value.as_tuple().digits), value.adjusted() + 4)
+        rounded = value.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
     return f"{rounded:,.0f}".replace(",", " ")
 
 
@@ -465,11 +596,164 @@ def format_number(value: Decimal | int | None) -> str:
     if value is None:
         return "—"
     if isinstance(value, Decimal):
-        rounded = value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        with localcontext() as context:
+            context.prec = max(28, len(value.as_tuple().digits), value.adjusted() + 4)
+            rounded = value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         text = f"{rounded:,.2f}"
     else:
         text = f"{value:,}"
     return text.replace(",", " ").replace(".", ",")
+
+
+def build_period_report(account_id, date_from, date_till, ticker="", progress=None):
+    marker = REPORT_CACHE.set({})
+    try:
+        return _build_period_report(account_id, date_from, date_till, ticker, progress)
+    finally:
+        REPORT_CACHE.reset(marker)
+
+
+def _build_period_report(account_id, date_from, date_till, ticker="", progress=None):
+    start_text, end_text = parse_period(date_from, date_till)
+    start = datetime.fromisoformat(start_text.replace("Z", "+00:00"))
+    end = datetime.fromisoformat(end_text.replace("Z", "+00:00"))
+    snapshot_at = datetime.now(timezone.utc)
+    if start > snapshot_at or end > snapshot_at + timedelta(days=1):
+        raise ValueError("Период не может быть в будущем")
+    # Load every operation type: transfers and corporate actions also change balances.
+    if progress:
+        progress("Текущие позиции и история", 0, None)
+    portfolio = api_call("OperationsService", "GetPortfolio", {"accountId": account_id})
+    operations = get_operations(account_id, date_from, snapshot_at.astimezone(MOSCOW).strftime("%d.%m.%Y"), progress, all_types=True)
+    link_operation_metadata(operations)
+    positions = portfolio.get("positions", [])
+    metadata = {p.get("ticker"): p for p in positions if p.get("ticker")}
+    for op in operations:
+        if op.get("ticker"):
+            metadata.setdefault(op["ticker"], op)
+    def key(op):
+        return op.get("ticker") or op.get("figi") or op.get("instrumentUid") or "—"
+    def instant(op):
+        return datetime.fromisoformat(op["date"].replace("Z", "+00:00"))
+    grouped = defaultdict(list)
+    for op in operations:
+        if not any(op.get(field) for field in ("ticker", "figi", "instrumentUid")):
+            continue
+        grouped[key(op)].append(op)
+    current = defaultdict(Decimal)
+    for position in positions:
+        current[key(position)] += decimal_value(position.get("quantity"))
+    all_keys = set(grouped) | set(current)
+    before_day = (start.astimezone(MOSCOW).date() - timedelta(days=1)).strftime("%d.%m.%Y")
+    result = {"open_instruments": [], "closed_instruments": [], "money": [], "operation_count": 0, "buy_quantity": 0, "sell_quantity": 0}
+    benchmark_ops = []
+    price_cache = {}
+    def value_on(meta, day):
+        instrument_id = meta.get("instrumentUid") or meta.get("figi")
+        if not instrument_id and meta.get("ticker") and meta.get("classCode"):
+            instrument_id = meta["ticker"] + "_" + meta["classCode"]
+        # Prefer the exchange order book for funds with multiple trading modes.
+        if meta.get("ticker") in {"TMON", "LQDT"}:
+            instrument_id = meta["ticker"] + "_TQBR"
+        cache_key = instrument_id, day
+        if cache_key in price_cache:
+            return price_cache[cache_key]
+        close = get_closing_price(instrument_id, day) if instrument_id else None
+        if not close:
+            raise TBankError("Нет цены на " + day)
+        price, close_date = close
+        if is_bond(meta):
+            day_date = datetime.strptime(day, "%d.%m.%Y").date()
+            data = api_call("InstrumentsService", "GetAccruedInterests", {
+                "instrumentId": meta.get("instrumentUid") or meta.get("figi") or instrument_id,
+                "from": datetime.combine(day_date, time.min, timezone.utc).isoformat(),
+                "to": datetime.combine(day_date + timedelta(days=1), time.min, timezone.utc).isoformat(),
+            })
+            entries = [entry for entry in data.get("accruedInterests", []) if entry.get("date", "")[:10] == day_date.isoformat()]
+            if not entries or decimal_value(entries[0].get("nominal")) <= 0:
+                raise TBankError("Нет исторического номинала/НКД на " + day)
+            price = price * decimal_value(entries[0]["nominal"]) / 100 + decimal_value(entries[0].get("value"))
+        else:
+            price = normalize_close_price(meta.get("ticker", ""), price, close_date, date_till)
+        price_cache[cache_key] = price, close_date
+        return price, close_date
+    for index, instrument_key in enumerate(sorted(all_keys)):
+        if ticker and instrument_key.upper() != ticker:
+            continue
+        meta = metadata.get(instrument_key, {})
+        if meta.get("instrumentType") in {"currency", "futures", "option"}:
+            continue
+        if progress:
+            progress("Остатки и оценка · " + instrument_key, index, len(all_keys))
+        ops = grouped[instrument_key]
+        period_ops = [op for op in ops if start <= instant(op) < end]
+        # Put quantities on the end-of-period split scale, including later trades.
+        def factor_at(timestamp):
+            factor = Decimal(1)
+            for effective, ratio in CORPORATE_ACTIONS.get(instrument_key, []):
+                if effective <= timestamp:
+                    factor *= ratio
+            return factor
+        report_at = min(end - timedelta(microseconds=1), snapshot_at)
+        report_factor = factor_at(report_at)
+        def delta(op):
+            quantity = Decimal(str(op.get("quantityDone") or op.get("quantity") or 0))
+            quantity *= report_factor / factor_at(instant(op))
+            kind = op.get("type")
+            if kind in BUY_TYPES | {"OPERATION_TYPE_INPUT_SECURITIES"}:
+                return quantity
+            if kind in SELL_TYPES | {"OPERATION_TYPE_OUTPUT_SECURITIES", "OPERATION_TYPE_BOND_REPAYMENT_FULL"}:
+                return -quantity
+            return Decimal(0)
+        now_quantity = current[instrument_key] * report_factor / factor_at(snapshot_at)
+        opening = now_quantity - sum((delta(op) for op in ops), Decimal(0))
+        closing = now_quantity - sum((delta(op) for op in ops if instant(op) >= end), Decimal(0))
+        if not period_ops and not opening and not closing:
+            continue
+        # Reuse the operation aggregation for trade statistics and income breakdown.
+        seed = {**meta, "ticker": instrument_key, "type": "PERIOD_POSITION", "quantity": "0", "price": {"currency": meta.get("currency") or (meta.get("currentPrice") or {}).get("currency", "rub")}}
+        summary = summarize(period_ops or [seed], date_till)
+        rows = summary["open_instruments"] + summary["closed_instruments"]
+        row = rows[0]
+        row.update(opening_quantity=opening, closing_quantity=closing, quantity_delta=closing,
+                   opening_value=None, closing_value=None, close_price=None, close_date=None,
+                   hypothetical_pnl=None, pnl=None, period_report=True)
+        row["is_bond"] = is_bond(meta) or row["is_bond"]
+        unsupported = [op for op in ops if op.get("type") not in set(TRADE_TYPES) | {"OPERATION_TYPE_INPUT_SECURITIES", "OPERATION_TYPE_OUTPUT_SECURITIES"} and int(op.get("quantityDone") or op.get("quantity") or 0)]
+        try:
+            if unsupported:
+                raise TBankError("История содержит изменение количества, требующее обработки: " + unsupported[0]["type"])
+            if opening < 0 or closing < 0:
+                raise TBankError("Короткие позиции пока не поддерживаются")
+            opening_price = value_on(meta, before_day)[0] if opening else Decimal(0)
+            close_price, close_date = value_on(meta, date_till) if closing else (Decimal(0), None)
+            row.update(opening_value=opening * opening_price, closing_value=closing * close_price,
+                       close_price=close_price if closing else None, close_date=close_date)
+            transfers = Decimal(0)
+            for op in period_ops:
+                if op.get("type") in {"OPERATION_TYPE_INPUT_SECURITIES", "OPERATION_TYPE_OUTPUT_SECURITIES"}:
+                    day = instant(op).astimezone(MOSCOW).strftime("%d.%m.%Y")
+                    transfers += delta(op) * value_on(meta, day)[0]
+            pnl = row["closing_value"] - row["opening_value"] + row["sell_cost"] - row["buy_cost"] + row["cash_adjustment"] - row["commission"] - transfers
+            row["pnl" if closing == 0 else "hypothetical_pnl"] = pnl
+            if opening:
+                benchmark_ops.append({**seed, "type": "OPERATION_TYPE_BUY", "date": start_text,
+                                      "quantity": str(opening), "price": {"currency": row["currency"], "units": "0"},
+                                      "benchmark_capital": row["opening_value"], "benchmark_day": before_day, "benchmark_normalized": True})
+            if transfers:
+                row["benchmark_blocked"] = "Сравнение при переводах бумаг пока недоступно"
+        except (TBankError, ValueError) as exc:
+            row["valuation_note"] = str(exc)
+            row["benchmark_blocked"] = str(exc)
+        result["closed_instruments" if closing == 0 else "open_instruments"].append(row)
+        result["buy_quantity"] += row["buy_quantity"]
+        result["sell_quantity"] += row["sell_quantity"]
+        result["operation_count"] += len(period_ops)
+        benchmark_ops.extend(period_ops)
+    add_tmon_benchmark(result, benchmark_ops, date_till, progress)
+    sort_by_pnl(result)
+    return result
+
 
 
 def run_report_job(job_id, form):
@@ -487,13 +771,8 @@ def run_report_job(job_id, form):
         accounts = get_accounts()
         if not any(account["id"] == form["account_id"] for account in accounts):
             raise ValueError("Выберите доступный счёт")
-        operations = get_operations(form["account_id"], form["date_from"], form["date_till"], progress)
-        if form["ticker"]:
-            operations = [op for op in operations if (op.get("ticker") or "").upper() == form["ticker"]]
-        progress("Подсчёт операций", 0, None)
-        result = summarize(operations, form["date_till"])
-        add_hypothetical_pnl(result, form["date_till"], progress)
-        add_tmon_benchmark(result, operations, form["date_till"], progress)
+        form_settings(form)
+        result = build_period_report(form["account_id"], form["date_from"], form["date_till"], form["ticker"], progress)
         with app.app_context():
             html = render_template("index.html", accounts=accounts, form=form, result=result, error=None)
         with JOBS_LOCK:
@@ -537,11 +816,12 @@ def report_progress(job_id):
 @app.route("/", methods=["GET", "POST"])
 def index():
     today = datetime.now(MOSCOW).date()
+    saved = form_settings()
     form = {
-        "date_from": request.form.get("date_from", today.replace(day=1).strftime("%d.%m.%Y")),
-        "date_till": request.form.get("date_till", today.strftime("%d.%m.%Y")),
-        "account_id": request.form.get("account_id", ""),
-        "ticker": request.form.get("ticker", "").strip().upper(),
+        "date_from": request.form.get("date_from", saved.get("date_from", today.replace(day=1).strftime("%d.%m.%Y"))),
+        "date_till": request.form.get("date_till", saved.get("date_till", today.strftime("%d.%m.%Y"))),
+        "account_id": request.form.get("account_id", saved.get("account_id", "")),
+        "ticker": request.form.get("ticker", saved.get("ticker", "")).strip().upper(),
     }
     accounts: list[dict] = []
     result = None
@@ -551,15 +831,9 @@ def index():
         if request.method == "POST":
             if not any(item["id"] == form["account_id"] for item in accounts):
                 raise ValueError("Выберите доступный счёт")
-            operations = get_operations(form["account_id"], form["date_from"], form["date_till"])
-            if form["ticker"]:
-                operations = [
-                    operation for operation in operations
-                    if (operation.get("ticker") or "").upper() == form["ticker"]
-                ]
-            result = summarize(operations, form["date_till"])
-            add_hypothetical_pnl(result, form["date_till"])
-            add_tmon_benchmark(result, operations, form["date_till"])
+            parse_period(form["date_from"], form["date_till"])
+            form_settings(form)
+            result = build_period_report(form["account_id"], form["date_from"], form["date_till"], form["ticker"])
     except (TBankError, ValueError) as exc:
         error = str(exc)
     return render_template("index.html", accounts=accounts, form=form, result=result, error=error)

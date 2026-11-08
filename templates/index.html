@@ -1,3 +1,14 @@
+{% macro tmon_cells(row) %}
+                  <td class="text-end text-nowrap"{% if row.tmon_error %} title="{{ row.tmon_error }}"{% endif %}>{{ row.tmon_pnl|default(none)|rubles }}{% if row.tmon_pnl is defined and row.tmon_pnl is not none %} RUB{% endif %}</td>
+                  {% set relative = row.tmon_relative_percent|default(none) %}
+                  <td class="text-end text-nowrap {% if relative is not none and relative > 25 %}text-success{% elif relative is not none and relative < -10 %}text-danger{% else %}text-body-secondary{% endif %}">
+                    {{ row.tmon_difference|default(none)|rubles }}{% if row.tmon_difference is defined and row.tmon_difference is not none %} RUB{% endif %}
+                    {% if row.tmon_relative_percent is defined and row.tmon_relative_percent is not none %}<div class="small">{% if row.tmon_relative_percent > 0 %}+{% endif %}{{ row.tmon_relative_percent|number }}%</div>{% endif %}
+                  </td>
+{% endmacro %}
+{% macro pnl_percent(row) %}
+  {% if row.pnl_return_percent is defined and row.pnl_return_percent is not none %}<div class="small fw-normal" title="PnL / (стоимость на начало + покупки) × 100%">{% if row.pnl_return_percent > 0 %}+{% endif %}{{ row.pnl_return_percent|number }}%</div>{% endif %}
+{% endmacro %}
 <!doctype html>
 <html lang="ru">
 <head>
@@ -5,9 +16,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>История операций T‑Bank</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    @media (min-width: 992px) {
+      .report-container { width: 75%; }
+    }
+  </style>
 </head>
 <body class="bg-body-tertiary">
-  <main class="container py-5" style="max-width: 900px">
+  <main class="container-fluid report-container px-3 px-lg-4 py-4">
     <h1 class="mb-1">История операций</h1>
     <p class="text-body-secondary mb-4">Покупки, продажи и комиссии по брокерскому счёту</p>
 
@@ -58,7 +74,16 @@
             <div class="col-sm-4"><div class="text-body-secondary">Продано бумаг</div><div class="fs-3 fw-semibold">{{ result.sell_quantity|number }}</div></div>
             <div class="col-sm-4"><div class="text-body-secondary">Торговых операций</div><div class="fs-3 fw-semibold">{{ result.operation_count|number }}</div></div>
           </div>
-          <h2 class="h5">Неполностью закрытые сделки</h2>
+          <div class="row g-3 mb-4">
+            {% for total in result.pnl_totals %}
+            <div class="col-auto">
+              <div class="text-body-secondary">Суммарный PnL{% if total.missing %} (неполный){% endif %}</div>
+              <div class="fs-3 fw-semibold text-nowrap {% if total.count and total.pnl > 0 %}text-success{% elif total.count and total.pnl < 0 %}text-danger{% endif %}">{% if total.count %}{{ total.pnl|rubles }} {{ total.currency }}{% else %}—{% endif %}</div>
+              {% if total.missing %}<div class="small text-body-secondary">Без рассчитанного PnL: {{ total.missing }}. Эти позиции не включены в сумму.</div>{% endif %}
+            </div>
+            {% endfor %}
+          </div>
+          <h2 class="h5">Позиции с остатком на конец периода</h2>
           <div class="table-responsive mb-4">
             <table class="table table-striped align-middle mb-4">
               <thead>
@@ -67,11 +92,15 @@
                   <th class="text-end">Куплено</th>
                   <th class="text-end">Ср. покупка</th>
                   <th class="text-end">Продано</th>
-                  <th class="text-end">Дельта</th>
+                  <th class="text-end">На начало</th>
+                  <th class="text-end">На конец</th>
                   <th class="text-end">Ср. продажа</th>
                   <th class="text-end">Комиссия</th>
                   <th class="text-end">Цена закрытия</th>
-                  <th class="text-end">Условный PnL</th>
+                  <th class="text-end">Выплаты − налог</th>
+                  <th class="text-end">Условный PnL ↓</th>
+                  <th class="text-end">PnL TMON</th>
+                  <th class="text-end">Разница с TMON</th>
                 </tr>
               </thead>
               <tbody>
@@ -81,31 +110,38 @@
                   <td class="text-end">{{ row.buy_quantity|number }}</td>
                   <td class="text-end">{{ row.average_buy|number }}{% if row.average_buy is not none %} {{ row.currency }}{% endif %}</td>
                   <td class="text-end">{{ row.sell_quantity|number }}</td>
-                  <td class="text-end fw-semibold {% if row.quantity_delta > 0 %}text-success{% elif row.quantity_delta < 0 %}text-danger{% endif %}">{% if row.quantity_delta > 0 %}+{% endif %}{{ row.quantity_delta|number }}</td>
+                  <td class="text-end">{{ row.opening_quantity|number if row.opening_quantity is defined else '—' }}</td>
+                  <td class="text-end">{{ row.closing_quantity|number if row.closing_quantity is defined else row.quantity_delta|number }}</td>
                   <td class="text-end">{{ row.average_sell|number }}{% if row.average_sell is not none %} {{ row.currency }}{% endif %}</td>
                   <td class="text-end">{{ row.commission|number }} {{ row.currency }}</td>
                   <td class="text-end">{{ row.close_price|number }}{% if row.close_price is not none %} {{ row.currency }}<div class="small text-body-secondary">{{ row.close_date }}</div>{% endif %}</td>
-                  <td class="text-end fw-semibold {% if row.hypothetical_pnl is not none and row.hypothetical_pnl > 0 %}text-success{% elif row.hypothetical_pnl is not none and row.hypothetical_pnl < 0 %}text-danger{% endif %}">{{ row.hypothetical_pnl|rubles }}{% if row.hypothetical_pnl is not none %} {{ row.currency }}{% endif %}{% if row.valuation_note %}<div class="small text-body-secondary">{{ row.valuation_note }}</div>{% endif %}</td>
+                  <td class="text-end text-nowrap">{{ row.cash_adjustment|rubles }} {{ row.currency }}</td>
+                  <td class="text-end text-nowrap fw-semibold"{% if row.valuation_note %} title="{{ row.valuation_note }}"{% endif %}><span class="{% if row.hypothetical_pnl is not none and row.hypothetical_pnl > 0 %}text-success{% elif row.hypothetical_pnl is not none and row.hypothetical_pnl < 0 %}text-danger{% endif %}">{{ row.hypothetical_pnl|rubles }}{% if row.hypothetical_pnl is not none %} {{ row.currency }}{% endif %}</span>{{ pnl_percent(row) }}</td>
+                  {{ tmon_cells(row) }}
                 </tr>
               {% else %}
-                <tr><td colspan="9" class="text-center text-body-secondary py-4">Нет инструментов с различающимся количеством покупок и продаж</td></tr>
+                <tr><td colspan="13" class="text-center text-body-secondary py-4">Нет позиций с остатком на конец периода</td></tr>
               {% endfor %}
               </tbody>
             </table>
           </div>
 
-          <h2 class="h5">Полностью закрытые сделки</h2>
+          <h2 class="h5">Позиции без остатка на конец периода</h2>
           <div class="table-responsive mb-4">
             <table class="table table-striped align-middle mb-0">
               <thead>
                 <tr>
                   <th>Инструмент</th>
                   <th class="text-end">Количество</th>
-                  <th class="text-end">Дельта</th>
+                  <th class="text-end">На начало</th>
+                  <th class="text-end">На конец</th>
                   <th class="text-end">Ср. покупка</th>
                   <th class="text-end">Ср. продажа</th>
                   <th class="text-end">Комиссия</th>
-                  <th class="text-end">PnL</th>
+                  <th class="text-end">Выплаты − налог</th>
+                  <th class="text-end">PnL ↓</th>
+                  <th class="text-end">PnL TMON</th>
+                  <th class="text-end">Разница с TMON</th>
                 </tr>
               </thead>
               <tbody>
@@ -113,49 +149,27 @@
                 <tr>
                   <td><strong>{{ row.ticker }}</strong>{% if row.name %}<div class="small text-body-secondary">{{ row.name }}</div>{% endif %}</td>
                   <td class="text-end">{{ row.buy_quantity|number }}</td>
-                  <td class="text-end">{{ row.quantity_delta|number }}</td>
+                  <td class="text-end">{{ row.opening_quantity|number if row.opening_quantity is defined else '—' }}</td>
+                  <td class="text-end">{{ row.closing_quantity|number if row.closing_quantity is defined else row.quantity_delta|number }}</td>
                   <td class="text-end">{{ row.average_buy|number }} {{ row.currency }}</td>
                   <td class="text-end">{{ row.average_sell|number }} {{ row.currency }}</td>
                   <td class="text-end">{{ row.commission|number }} {{ row.currency }}</td>
-                  <td class="text-end fw-semibold {% if row.pnl > 0 %}text-success{% elif row.pnl < 0 %}text-danger{% endif %}">{{ row.pnl|rubles }} {{ row.currency }}</td>
+                  <td class="text-end text-nowrap">{{ row.cash_adjustment|rubles }} {{ row.currency }}</td>
+                  <td class="text-end text-nowrap fw-semibold {% if row.pnl is not none and row.pnl > 0 %}text-success{% elif row.pnl is not none and row.pnl < 0 %}text-danger{% endif %}">{{ row.pnl|rubles }} {{ row.currency }}{{ pnl_percent(row) }}</td>
+                  {{ tmon_cells(row) }}
                 </tr>
               {% else %}
-                <tr><td colspan="7" class="text-center text-body-secondary py-4">Нет инструментов с равным ненулевым количеством покупок и продаж</td></tr>
+                <tr><td colspan="11" class="text-center text-body-secondary py-4">Нет позиций без остатка на конец периода</td></tr>
               {% endfor %}
               </tbody>
             </table>
           </div>
-          <p class="small text-body-secondary">Закрытие определяется только внутри выбранного периода. Для незакрытых строк условный PnL предполагает продажу остатка или покрытие шорта по последней биржевой цене закрытия не позже конечной даты. Будущая комиссия, FIFO и позиции до начала периода не учитываются. Удержанный налог с купонов и дивидендов учитывается по операциям API.</p>
+          <p class="small text-body-secondary">PnL за период = стоимость остатка на конец − стоимость позиции на начало + продажи − покупки + выплаты − налог − комиссии. Начальная оценка берётся по последнему закрытию до первого дня периода. Количество восстанавливается по текущему портфелю и последующим операциям. Переводы бумаг учитываются как ввод/вывод капитала по цене на дату перевода. Для облигаций цена в процентах переводится в деньги по историческому номиналу с добавлением НКД. Строки без необходимых данных исключаются из суммы PnL.</p>
           <p class="small text-body-secondary">Для тикера T операции до сплита 15.04.2026 нормализуются к шкале конечной даты: количество × 10, цена ÷ 10. Комиссии не пересчитываются.</p>
 
-          <h2 class="h5">Выплаты по бумагам</h2>
-          <p class="small text-body-secondary">Фактические выплаты и удержания за выбранный период включены в PnL. Частичное погашение не уменьшает количество бумаг; полное погашение закрывает соответствующее количество. Для облигаций суммы сделок берутся из денежных платежей API, включая НКД. Для открытых облигаций PnL пока не показывается: оценка остатка требует исторического номинала и НКД. Позиции до начала периода не восстанавливаются.</p>
-          <div class="table-responsive mb-4">
-            <table class="table">
-              <thead><tr><th>Инструмент</th><th class="text-end">Купоны</th><th class="text-end">Дивиденды</th><th class="text-end">Налог с выплат</th><th class="text-end">Погашения</th><th>Валюта</th></tr></thead>
-              <tbody>
-              {% for row in result.open_instruments + result.closed_instruments if row.coupons or row.dividends or row.income_tax or row.repayments %}
-                <tr><td>{{ row.ticker }}</td><td class="text-end">{{ row.coupons|rubles }}</td><td class="text-end">{{ row.dividends|rubles }}</td><td class="text-end">{{ row.income_tax|rubles }}</td><td class="text-end">{{ row.repayments|rubles }}</td><td>{{ row.currency }}</td></tr>
-              {% else %}
-                <tr><td colspan="6" class="text-body-secondary">За период выплат нет</td></tr>
-              {% endfor %}
-              </tbody>
-            </table>
-          </div>
+          <p class="small text-body-secondary">«Выплаты − налог» — купоны, погашения и дивиденды за выбранный период за вычетом удержанного с них налога. Эта сумма уже включена в PnL строки. Частичное погашение не уменьшает количество бумаг. Для облигаций остаток оценивается с историческим номиналом и НКД.</p>
 
-          <h2 class="h5">Сравнение с TMON</h2>
-          <p class="small text-body-secondary">Те же суммы покупок и даты, без комиссии за TMON. При продаже закрываем соответствующую часть вложения по FIFO; остаток оцениваем на конец периода. Используем дробные паи и последнюю доступную цену закрытия на дату операции. Гипотетический налог TMON не учитывается. Разница = PnL бумаги после комиссий и удержанного налога с выплат − PnL TMON. Опережение в п.п. = разница / сумма покупок × 100%; это разница доходностей на вложенную сумму, без пересчёта в годовые.</p>
-          <div class="table-responsive mb-4">
-            <table class="table">
-              <thead><tr><th>Инструмент</th><th class="text-end">PnL TMON, RUB</th><th class="text-end">Разница, RUB</th><th class="text-end">Опережение TMON, п.п.</th></tr></thead>
-              <tbody>
-              {% for row in result.open_instruments + result.closed_instruments if not row.is_bond %}
-                <tr><td>{{ row.ticker }}{% if row.tmon_error %}<div class="small text-body-secondary">{{ row.tmon_error }}</div>{% endif %}</td><td class="text-end">{{ row.tmon_pnl|rubles }}</td><td class="text-end">{{ row.tmon_difference|rubles }}</td><td class="text-end">{{ row.tmon_difference_pp|number }}</td></tr>
-              {% endfor %}
-              </tbody>
-            </table>
-          </div>
-
+          <p class="small text-body-secondary">Начальная стоимость позиции условно вкладывается в TMON на начало периода; далее используются те же суммы покупок и даты, без комиссии за TMON. При продаже закрываем соответствующую часть вложения по FIFO; остаток оцениваем на конец периода. Используем дробные паи и последнюю доступную цену закрытия на дату операции. Гипотетический налог TMON не учитывается. Разница = PnL бумаги после комиссий и удержанного налога с выплат − PnL TMON. Под PnL указана доходность: PnL / (начальная стоимость + покупки) × 100%. Под разницей с TMON — превышение прибыли: (PnL бумаги / PnL TMON − 1) × 100%. При нулевой или отрицательной прибыли TMON относительное сравнение не показывается. Показатели не пересчитываются в годовые.</p>
           <h2 class="h5">Итого по валютам</h2>
           <div class="table-responsive">
             <table class="table align-middle mb-0">
